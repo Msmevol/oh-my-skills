@@ -1,0 +1,4 @@
+requests>=2.31.0
+sseclient-py>=1.8.0
+pytest>=7.4.0
+pytest-mock>=3.11.0

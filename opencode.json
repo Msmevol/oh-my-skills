@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "skill-executor": {
+      "description": "专门执行复杂 skill 的 agent。严格按照 skill 定义的步骤执行，使用 todowrite 管理任务，不要跳步，不要提前结束。",
+      "mode": "primary",
+      "model": "opencode/qwen3-30b-a3b-instruct-2507",
+      "temperature": 0.2,
+      "steps": 200,
+      "prompt": "{file:./prompts/skill_executor.txt}",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    }
+  }
+}

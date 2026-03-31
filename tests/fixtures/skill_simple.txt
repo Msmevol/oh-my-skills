@@ -1,0 +1,27 @@
+---
+name: test-simple-skill
+description: "测试简单技能：创建文件并验证"
+tags: ["test", "simple"]
+---
+
+# 简单测试 Skill
+
+这是一个用于测试 skill runner 的简单 skill。
+
+## 步骤
+
+1. 使用 todowrite 创建以下任务列表：
+   - 创建 hello.py 文件
+   - 写入 print("Hello World") 内容
+   - 验证文件内容正确
+
+2. 逐个执行：
+   - 创建 hello.py，写入内容
+   - 读取验证内容
+   - 标记所有任务为 completed
+
+3. 汇报结果
+
+## 输出格式
+- [OK] 所有任务完成
+- [FAIL] 任务失败：原因

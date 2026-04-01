@@ -67,6 +67,25 @@ class SkillDiscovery:
     ]
 
     @classmethod
+    def _find_base_dirs(cls, start_dir: str = None) -> List[str]:
+        """从当前目录向上遍历，找到所有可能的 base_dir"""
+        base_dirs = []
+        current = os.path.abspath(start_dir or os.getcwd())
+
+        # 添加当前目录
+        base_dirs.append(current)
+
+        # 向上遍历直到根目录
+        while True:
+            parent = os.path.dirname(current)
+            if parent == current:
+                break  # 到达根目录
+            base_dirs.append(parent)
+            current = parent
+
+        return base_dirs
+
+    @classmethod
     def find_skills(cls, base_dir: str = None) -> List[Dict[str, str]]:
         """发现所有可用的 skills
 
@@ -74,15 +93,59 @@ class SkillDiscovery:
             [{"name": "xxx", "path": "/path/to/SKILL.md", "description": "..."}]
         """
         skills = []
-        search_dirs = list(cls.SEARCH_PATHS)
+        seen_paths = set()
 
-        if base_dir:
-            search_dirs = [os.path.join(base_dir, p) for p in cls.SEARCH_PATHS]
+        # 从当前目录向上遍历查找
+        base_dirs = cls._find_base_dirs(base_dir)
+
+        for bd in base_dirs:
+            for rel_path in cls.SEARCH_PATHS:
+                skills_dir = os.path.join(bd, rel_path)
+                if not os.path.isdir(skills_dir):
+                    continue
+
+                for skill_dir in os.listdir(skills_dir):
+                    skill_md = os.path.join(skills_dir, skill_dir, "SKILL.md")
+                    if not os.path.isfile(skill_md):
+                        continue
+
+                    abs_path = os.path.abspath(skill_md)
+                    if abs_path in seen_paths:
+                        continue
+                    seen_paths.add(abs_path)
+
+                    # 解析 frontmatter 获取 name 和 description
+                    try:
+                        with open(skill_md, "r", encoding="utf-8") as f:
+                            content = f.read()
+
+                        name = skill_dir
+                        description = ""
+
+                        # 解析 YAML frontmatter
+                        if content.startswith("---"):
+                            end = content.find("---", 3)
+                            if end > 0:
+                                frontmatter = content[3:end]
+                                for line in frontmatter.split("\n"):
+                                    if line.startswith("name:"):
+                                        name = line.split(":", 1)[1].strip()
+                                    elif line.startswith("description:"):
+                                        desc = line.split(":", 1)[1].strip()
+                                        description = desc.strip('"').strip("'")
+
+                        skills.append(
+                            {
+                                "name": name,
+                                "path": abs_path,
+                                "description": description,
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to parse skill {skill_md}: {e}")
 
         # 添加全局路径
-        search_dirs.extend(cls.GLOBAL_PATHS)
-
-        for skills_dir in search_dirs:
+        for skills_dir in cls.GLOBAL_PATHS:
             if not os.path.isdir(skills_dir):
                 continue
 
@@ -91,7 +154,11 @@ class SkillDiscovery:
                 if not os.path.isfile(skill_md):
                     continue
 
-                # 解析 frontmatter 获取 name 和 description
+                abs_path = os.path.abspath(skill_md)
+                if abs_path in seen_paths:
+                    continue
+                seen_paths.add(abs_path)
+
                 try:
                     with open(skill_md, "r", encoding="utf-8") as f:
                         content = f.read()
@@ -99,7 +166,6 @@ class SkillDiscovery:
                     name = skill_dir
                     description = ""
 
-                    # 解析 YAML frontmatter
                     if content.startswith("---"):
                         end = content.find("---", 3)
                         if end > 0:
@@ -114,7 +180,7 @@ class SkillDiscovery:
                     skills.append(
                         {
                             "name": name,
-                            "path": os.path.abspath(skill_md),
+                            "path": abs_path,
                             "description": description,
                         }
                     )
@@ -159,14 +225,45 @@ class SkillDiscovery:
                 logger.error(f"Failed to load skill file {skill_name_or_path}: {e}")
                 return None
 
-        # 2. 从搜索路径查找
-        search_dirs = list(cls.SEARCH_PATHS)
-        if base_dir:
-            search_dirs = [os.path.join(base_dir, p) for p in cls.SEARCH_PATHS]
-        search_dirs.extend(cls.GLOBAL_PATHS)
+        # 2. 从搜索路径查找（向上遍历父目录）
+        base_dirs = cls._find_base_dirs(base_dir)
 
-        for skills_dir in search_dirs:
-            # 尝试 SKILL.md 格式
+        for bd in base_dirs:
+            for rel_path in cls.SEARCH_PATHS:
+                skills_dir = os.path.join(bd, rel_path)
+
+                # 尝试 SKILL.md 格式
+                skill_md = os.path.join(skills_dir, skill_name_or_path, "SKILL.md")
+                if os.path.isfile(skill_md):
+                    try:
+                        with open(skill_md, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        return {
+                            "name": skill_name_or_path,
+                            "content": content,
+                            "path": os.path.abspath(skill_md),
+                        }
+                    except Exception as e:
+                        logger.error(f"Failed to load skill {skill_md}: {e}")
+                        return None
+
+                # 尝试 .txt 格式（兼容旧格式）
+                skill_txt = os.path.join(skills_dir, f"{skill_name_or_path}.txt")
+                if os.path.isfile(skill_txt):
+                    try:
+                        with open(skill_txt, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        return {
+                            "name": skill_name_or_path,
+                            "content": content,
+                            "path": os.path.abspath(skill_txt),
+                        }
+                    except Exception as e:
+                        logger.error(f"Failed to load skill {skill_txt}: {e}")
+                        return None
+
+        # 3. 全局路径
+        for skills_dir in cls.GLOBAL_PATHS:
             skill_md = os.path.join(skills_dir, skill_name_or_path, "SKILL.md")
             if os.path.isfile(skill_md):
                 try:
@@ -179,21 +276,6 @@ class SkillDiscovery:
                     }
                 except Exception as e:
                     logger.error(f"Failed to load skill {skill_md}: {e}")
-                    return None
-
-            # 尝试 .txt 格式（兼容旧格式）
-            skill_txt = os.path.join(skills_dir, f"{skill_name_or_path}.txt")
-            if os.path.isfile(skill_txt):
-                try:
-                    with open(skill_txt, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    return {
-                        "name": skill_name_or_path,
-                        "content": content,
-                        "path": os.path.abspath(skill_txt),
-                    }
-                except Exception as e:
-                    logger.error(f"Failed to load skill {skill_txt}: {e}")
                     return None
 
         return None
@@ -239,17 +321,31 @@ class Orchestrator:
             return True
 
         try:
-            self.server_proc = subprocess.Popen(
+            # On Windows, opencode is a .cmd file, need shell=True or full path
+            cmd = (
                 [
+                    "opencode.cmd",
+                    "serve",
+                    "--port",
+                    str(self.port),
+                    "--hostname",
+                    self.host,
+                ]
+                if sys.platform == "win32"
+                else [
                     "opencode",
                     "serve",
                     "--port",
                     str(self.port),
                     "--hostname",
                     self.host,
-                ],
+                ]
+            )
+            self.server_proc = subprocess.Popen(
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                shell=sys.platform == "win32",
                 creationflags=subprocess.CREATE_NO_WINDOW
                 if sys.platform == "win32"
                 else 0,

@@ -1,0 +1,1 @@
+"""Tests plugins package"""

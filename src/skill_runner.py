@@ -1,17 +1,18 @@
 """
-Universal Skill Runner - 通用 skill 执行器
+Universal Skill Runner - 通用 skill 执行器（插件化架构）
 
 架构原则：编排器管节奏（PACE），agent 管内容（CONTENT）
 
 编排器职责（零业务逻辑）：
 1. 启动 opencode serve
 2. 创建 session，发送 skill 完整内容 + 用户请求
-3. 轮询监控：
+3. 轮询监控（通过检测插件）：
    - session 还活着吗？
    - todos 完成了吗？
    - 卡死了？→ 重启
    - 偷懒了（idle 但 todos 未完成）？→ 重启
-4. 验证所有 todos 完成
+   - 提前结束了（done 但 todos 未完成）？→ 重启
+4. 验证所有 todos 完成（通过验证插件）
 5. 返回结果
 
 agent 职责：
@@ -21,6 +22,11 @@ agent 职责：
 4. 汇报结果
 
 这样任何 skill 文件都能跑，编排器不需要知道 skill 具体做什么。
+
+插件架构：
+- 检测插件：StuckDetector, IdleIncompleteDetector, PrematureEndDetector, SessionInvalidDetector
+- 恢复插件：RestartRecovery
+- 验证插件：StableCompletionVerifier, TodoExecutionVerifier
 """
 
 import logging
@@ -29,6 +35,18 @@ from typing import Optional, Dict, Any, List
 
 from .opencode_client import OpenCodeClient
 from .agent_session import AgentSession, SessionError, MaxRetriesExceeded
+from .plugins import PluginRegistry, DetectionResult
+from .plugins.builtin_detectors import (
+    StuckDetector,
+    IdleIncompleteDetector,
+    PrematureEndDetector,
+    SessionInvalidDetector,
+)
+from .plugins.builtin_recovery import RestartRecovery
+from .plugins.builtin_verification import (
+    StableCompletionVerifier,
+    TodoExecutionVerifier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +58,10 @@ class SkillRunnerError(Exception):
 
 
 class SkillRunner:
-    """通用 skill 执行器
+    """通用 skill 执行器（插件化）
 
     不解析 skill 内容，不硬编码任何业务逻辑。
-    纯粹的看门狗：发 prompt → 监控 → 验证 → 必要时重启。
+    纯粹的看门狗：发 prompt → 监控（插件） → 验证（插件） → 必要时重启（插件）。
     """
 
     def __init__(
@@ -55,6 +73,7 @@ class SkillRunner:
         max_execution_time: int = 3600,
         poll_interval: int = 10,
         verification_stable_count: int = 3,
+        plugin_registry: Optional[PluginRegistry] = None,
     ):
         self.client = client
         self.agent_name = agent_name
@@ -66,6 +85,31 @@ class SkillRunner:
 
         self.session: Optional[AgentSession] = None
         self.execution_log: List[Dict[str, Any]] = []
+
+        self.registry = plugin_registry or PluginRegistry()
+        if not plugin_registry:
+            self._register_builtin_plugins()
+
+    def _register_builtin_plugins(self):
+        """注册内置插件"""
+        self.registry.register_detection(PrematureEndDetector(), priority=100)
+        self.registry.register_detection(SessionInvalidDetector(), priority=90)
+        self.registry.register_detection(
+            StuckDetector(timeout=self.stuck_threshold), priority=80
+        )
+        self.registry.register_detection(IdleIncompleteDetector(), priority=70)
+
+        self.registry.register_recovery(
+            RestartRecovery(agent_name=self.agent_name), priority=100
+        )
+
+        self.registry.register_verification(
+            StableCompletionVerifier(stable_count=self.verification_stable_count),
+            priority=100,
+        )
+        self.registry.register_verification(TodoExecutionVerifier(), priority=50)
+
+        logger.info(f"Built-in plugins registered: {self.registry.list_plugins()}")
 
     def run(
         self,
@@ -104,10 +148,8 @@ class SkillRunner:
         restart_count = 0
 
         try:
-            # 1. 构建 prompt（skill 完整内容 + 用户请求）
             prompt = self._build_prompt(skill_content, user_request)
 
-            # 2. 创建 session 并发送 prompt
             self.session = self._create_session(skill_name)
             self.session.send(prompt)
 
@@ -123,16 +165,14 @@ class SkillRunner:
                 }
             )
 
-            # 3. 主循环：监控 → 验证 → 必要时重启
             start_time = time.time()
 
             while time.time() - start_time < self.max_execution_time:
                 elapsed = time.time() - start_time
 
-                # 3a. 检查是否全部完成
                 if self._all_todos_completed():
                     logger.info("All todos completed! Verifying stability...")
-                    if self._verify_stable_completion():
+                    if self._verify_completion():
                         result["status"] = "success"
                         result["progress"] = self._get_progress()
                         result["todos"] = self._get_todos()
@@ -140,18 +180,24 @@ class SkillRunner:
                         return result
                     else:
                         logger.warning(
-                            "Completion not stable, continuing to monitor..."
+                            "Completion verification failed, continuing to monitor..."
                         )
 
-                # 3b. 检查是否卡死
-                if self.session.is_stuck(timeout=self.stuck_threshold):
+                detection_result = self.registry.run_all_detections(
+                    self.session, self.client
+                )
+                if detection_result and detection_result.detected:
                     logger.warning(
-                        f"Session stuck (elapsed: {elapsed:.0f}s). "
+                        f"Detection: {detection_result.reason} "
+                        f"(severity: {detection_result.severity}, "
+                        f"elapsed: {elapsed:.0f}s). "
                         f"Restart {restart_count + 1}/{self.max_restarts}"
                     )
                     self.execution_log.append(
                         {
-                            "event": "stuck_detected",
+                            "event": "detection_triggered",
+                            "detector": detection_result.reason,
+                            "severity": detection_result.severity,
                             "elapsed": elapsed,
                             "restart": restart_count + 1,
                             "timestamp": time.time(),
@@ -163,49 +209,44 @@ class SkillRunner:
                     if restart_count >= self.max_restarts:
                         result["error"] = (
                             f"Max restarts ({self.max_restarts}) exceeded. "
-                            f"Skill execution failed."
+                            f"Last issue: {detection_result.reason}"
                         )
                         result["progress"] = self._get_progress()
                         result["todos"] = self._get_todos()
                         return result
 
-                    self.session = self._restart_session(skill_name, restart_count)
-                    continue
-
-                # 3c. 检查是否 idle 但有未完成 todos（模型偷懒）
-                if self._is_idle_but_incomplete():
-                    logger.warning(
-                        f"Session idle but todos incomplete (elapsed: {elapsed:.0f}s). "
-                        f"Restart {restart_count + 1}/{self.max_restarts}"
+                    new_session = self.registry.run_recovery(
+                        self.session,
+                        self.client,
+                        context={
+                            "restart_count": restart_count,
+                            "detection_result": detection_result,
+                            "skill_name": skill_name,
+                        },
                     )
+
+                    if new_session is None:
+                        result["error"] = (
+                            f"Recovery failed after detecting: {detection_result.reason}"
+                        )
+                        result["progress"] = self._get_progress()
+                        result["todos"] = self._get_todos()
+                        return result
+
+                    self.session = new_session
+
                     self.execution_log.append(
                         {
-                            "event": "idle_incomplete",
-                            "elapsed": elapsed,
-                            "progress": self._get_progress(),
-                            "restart": restart_count + 1,
+                            "event": "recovered",
+                            "restart_count": restart_count,
+                            "new_session_id": self.session.session_id,
                             "timestamp": time.time(),
                         }
                     )
-
-                    restart_count += 1
-                    result["restart_count"] = restart_count
-                    if restart_count >= self.max_restarts:
-                        result["error"] = (
-                            f"Max restarts ({self.max_restarts}) exceeded. "
-                            f"Agent unable to complete todos."
-                        )
-                        result["progress"] = self._get_progress()
-                        result["todos"] = self._get_todos()
-                        return result
-
-                    self.session = self._restart_session(skill_name, restart_count)
                     continue
 
-                # 3d. 等待后继续轮询
                 time.sleep(self.poll_interval)
 
-                # 打印进度
                 progress = self._get_progress()
                 if progress["total"] > 0:
                     logger.info(
@@ -215,7 +256,6 @@ class SkillRunner:
                         f"Elapsed: {elapsed:.0f}s"
                     )
 
-            # 超时
             result["error"] = (
                 f"Execution timed out after {self.max_execution_time}s. "
                 f"Completed {self._get_progress()['completed']}/"
@@ -238,11 +278,7 @@ class SkillRunner:
             return result
 
     def _build_prompt(self, skill_content: str, user_request: str) -> str:
-        """构建执行 prompt
-
-        将 skill 完整内容 + 用户请求组合成一个 prompt。
-        agent 负责理解并执行。
-        """
+        """构建执行 prompt"""
         return (
             f"你是一个专业的 skill 执行 agent。请严格按照以下 skill 定义执行任务。\n\n"
             f"## Skill 定义\n\n"
@@ -274,117 +310,14 @@ class SkillRunner:
         logger.info(f"Created session: {session_id}")
         return session
 
-    def _restart_session(self, skill_name: str, restart_count: int) -> AgentSession:
-        """重启 session 并继续执行
-
-        构建继续执行的消息，包含剩余任务信息。
-        """
-        # 获取剩余任务
-        remaining_todos = []
-        completed_todos = []
-        try:
-            todos = self.client.get_todo(self.session.session_id)
-            remaining_todos = [t for t in todos if t.get("status") != "completed"]
-            completed_todos = [t for t in todos if t.get("status") == "completed"]
-        except Exception as e:
-            logger.warning(f"Failed to get todos: {e}")
-
-        # 构建继续消息
-        remaining_list = "\n".join(
-            [f"- {t.get('content', 'unknown')}" for t in remaining_todos]
-        )
-        completed_list = "\n".join(
-            [f"- {t.get('content', 'unknown')}" for t in completed_todos]
-        )
-
-        continue_msg = (
-            f"之前的执行被中断（第 {restart_count} 次重启），请继续完成剩余任务。\n\n"
-            f"已完成的任务:\n{completed_list}\n\n"
-            f"剩余必须完成的任务:\n{remaining_list}\n\n"
-            f"重要要求：\n"
-            f"1. 你必须继续完成以上所有剩余任务\n"
-            f"2. 每完成一个任务就立即用 todowrite 标记为 completed\n"
-            f"3. 不要跳过任何任务，不要提前结束\n"
-            f"4. 如果遇到困难，尝试多种方法解决\n"
-            f"5. 只有当所有任务都真正完成后才能结束\n\n"
-            f"现在开始继续执行剩余任务。"
-        )
-
-        new_session = self._create_session(f"{skill_name}-restart-{restart_count}")
-        new_session.send(continue_msg)
-
-        self.execution_log.append(
-            {
-                "event": "restarted",
-                "restart_count": restart_count,
-                "remaining_tasks": len(remaining_todos),
-                "completed_tasks": len(completed_todos),
-                "new_session_id": new_session.session_id,
-                "timestamp": time.time(),
-            }
-        )
-
-        return new_session
-
     def _all_todos_completed(self) -> bool:
         """检查是否所有 todos 都完成了"""
         progress = self._get_progress()
         return progress["total"] > 0 and progress["pending"] == 0
 
-    def _is_idle_but_incomplete(self) -> bool:
-        """检查 session 是否 idle 但 todos 未完成（模型偷懒）"""
-        if not self.session or not self.session.session_id:
-            return False
-
-        try:
-            all_status = self.client.get_session_status()
-            session_status = all_status.get(self.session.session_id, {})
-            state = session_status.get("state", "unknown")
-
-            if state != "idle":
-                return False
-
-            progress = self._get_progress()
-            return progress["total"] > 0 and progress["pending"] > 0
-
-        except Exception as e:
-            logger.warning(f"Error checking idle status: {e}")
-            return False
-
-    def _verify_stable_completion(self) -> bool:
-        """验证完成状态是否稳定
-
-        连续多次检查，确保 todos 确实全部完成且 session 稳定 idle。
-        防止 agent 短暂标记完成后又改变。
-        """
-        for i in range(self.verification_stable_count):
-            time.sleep(3)
-
-            # 检查 todos
-            progress = self._get_progress()
-            if progress["pending"] > 0:
-                logger.warning(
-                    f"Verification {i + 1}/{self.verification_stable_count}: "
-                    f"{progress['pending']} tasks still pending"
-                )
-                return False
-
-            # 检查 session 状态
-            try:
-                all_status = self.client.get_session_status()
-                session_status = all_status.get(self.session.session_id, {})
-                state = session_status.get("state", "unknown")
-
-                if state == "busy":
-                    logger.warning(
-                        f"Verification {i + 1}/{self.verification_stable_count}: "
-                        f"Session still busy"
-                    )
-                    return False
-            except Exception as e:
-                logger.warning(f"Error checking status: {e}")
-
-        return True
+    def _verify_completion(self) -> bool:
+        """通过验证插件验证完成状态"""
+        return self.registry.run_all_verifications(self.session, self.client)
 
     def _get_progress(self) -> Dict[str, Any]:
         """获取当前进度"""

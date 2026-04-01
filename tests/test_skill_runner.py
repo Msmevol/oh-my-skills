@@ -1,5 +1,5 @@
 """
-Tests for the Universal Skill Runner
+Tests for the Universal Skill Runner (Plugin Architecture)
 
 三层测试：
 1. 单元测试（Mock，不需要真实 opencode）
@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import time
 
 from src.skill_runner import SkillRunner, SkillRunnerError
+from src.plugins import PluginRegistry, DetectionResult, DetectionPlugin
 
 
 class TestSkillRunnerUnit(unittest.TestCase):
@@ -37,6 +38,10 @@ class TestSkillRunnerUnit(unittest.TestCase):
         assert self.runner.verification_stable_count == 2
         assert self.runner.session is None
         assert self.runner.execution_log == []
+        assert self.runner.registry is not None
+        assert self.runner.registry.detection_count > 0
+        assert self.runner.registry.recovery_count > 0
+        assert self.runner.registry.verification_count > 0
 
     def test_build_prompt(self):
         """测试 prompt 构建正确性"""
@@ -52,9 +57,19 @@ class TestSkillRunnerUnit(unittest.TestCase):
         assert "不要跳步" in prompt
         assert "不要提前结束" in prompt
 
+    def test_custom_plugin_registry(self):
+        """测试自定义插件注册表"""
+        custom_registry = PluginRegistry()
+        runner = SkillRunner(
+            client=self.mock_client,
+            plugin_registry=custom_registry,
+        )
+        assert runner.registry is custom_registry
+        assert runner.registry.detection_count == 0
+
     @patch.object(SkillRunner, "_create_session")
     @patch.object(SkillRunner, "_all_todos_completed")
-    @patch.object(SkillRunner, "_verify_stable_completion")
+    @patch.object(SkillRunner, "_verify_completion")
     @patch.object(SkillRunner, "_get_progress")
     @patch.object(SkillRunner, "_get_todos")
     def test_run_success(
@@ -92,56 +107,53 @@ class TestSkillRunnerUnit(unittest.TestCase):
         assert mock_create.called
         assert mock_session.send.called
 
-    @patch.object(SkillRunner, "_create_session")
-    @patch.object(SkillRunner, "_restart_session")
-    @patch.object(SkillRunner, "_all_todos_completed")
-    @patch.object(SkillRunner, "_verify_stable_completion")
-    @patch.object(SkillRunner, "_get_progress")
-    @patch.object(SkillRunner, "_get_todos")
-    @patch.object(SkillRunner, "_is_idle_but_incomplete")
-    def test_run_stuck_restart(
-        self,
-        mock_idle,
-        mock_get_todos,
-        mock_get_progress,
-        mock_verify,
-        mock_all_done,
-        mock_restart,
-        mock_create,
-    ):
-        """测试卡死自动重启"""
-        mock_session1 = MagicMock()
-        mock_session1.session_id = "test-session-1"
-        mock_session1.is_stuck.side_effect = [True, False]
+    def test_run_detection_triggers_restart(self):
+        """测试检测插件触发重启"""
 
-        mock_session2 = MagicMock()
-        mock_session2.session_id = "test-session-2"
-        mock_session2.is_stuck.return_value = False
+        class TriggerOnceDetector(DetectionPlugin):
+            def __init__(self):
+                self.triggered = False
 
-        call_count = [0]
+            @property
+            def name(self):
+                return "trigger_once"
 
-        def create_side_effect(*args):
-            call_count[0] += 1
-            return mock_session1 if call_count[0] == 1 else mock_session2
+            def detect(self, session, client):
+                if not self.triggered:
+                    self.triggered = True
+                    return DetectionResult(
+                        detected=True,
+                        reason="test detection",
+                        severity="high",
+                    )
+                return DetectionResult(detected=False)
 
-        mock_create.side_effect = create_side_effect
+        detector = TriggerOnceDetector()
+        self.runner.registry.register_detection(detector, priority=200)
+        self.runner.poll_interval = 0.1
+        self.runner.max_restarts = 3
 
-        mock_all_done.side_effect = [False, True]
-        mock_verify.return_value = True
-        mock_get_progress.return_value = {
+        mock_session = MagicMock()
+        mock_session.session_id = "test-session-1"
+        mock_session.get_progress.return_value = {
             "total": 3,
             "completed": 1,
             "pending": 2,
             "percentage": 33.3,
         }
-        mock_get_todos.return_value = [
+        self.runner.session = mock_session
+
+        self.mock_client.get_session_status.return_value = {
+            "test-session-1": {"state": "idle"},
+            "new-session": {"state": "idle"},
+        }
+        self.mock_client.get_todo.return_value = [
             {"content": "t1", "status": "completed"},
             {"content": "t2", "status": "pending"},
         ]
-        mock_idle.return_value = False
-        mock_restart.return_value = mock_session2
-
-        self.runner.poll_interval = 0.1
+        self.mock_client.create_session.return_value = "new-session"
+        self.mock_client.send_message.return_value = {}
+        self.mock_client.abort_session.return_value = True
 
         result = self.runner.run(
             skill_content="# Test Skill",
@@ -150,29 +162,20 @@ class TestSkillRunnerUnit(unittest.TestCase):
         )
 
         assert result["restart_count"] >= 1
-        assert mock_restart.called
+        assert self.mock_client.create_session.called
+        assert self.mock_client.abort_session.called
 
     @patch.object(SkillRunner, "_create_session")
-    @patch.object(SkillRunner, "_restart_session")
     @patch.object(SkillRunner, "_all_todos_completed")
-    @patch.object(SkillRunner, "_verify_stable_completion")
+    @patch.object(SkillRunner, "_verify_completion")
     @patch.object(SkillRunner, "_get_progress")
     @patch.object(SkillRunner, "_get_todos")
-    @patch.object(SkillRunner, "_is_idle_but_incomplete")
     def test_run_max_restarts(
-        self,
-        mock_idle,
-        mock_get_todos,
-        mock_get_progress,
-        mock_verify,
-        mock_all_done,
-        mock_restart,
-        mock_create,
+        self, mock_get_todos, mock_get_progress, mock_verify, mock_all_done, mock_create
     ):
         """测试超过最大重启次数"""
         mock_session = MagicMock()
         mock_session.session_id = "test-session-1"
-        mock_session.is_stuck.return_value = True
         mock_create.return_value = mock_session
 
         mock_all_done.return_value = False
@@ -185,9 +188,20 @@ class TestSkillRunnerUnit(unittest.TestCase):
         mock_get_todos.return_value = [
             {"content": "t1", "status": "pending"},
         ]
-        mock_idle.return_value = False
-        mock_restart.return_value = mock_session
 
+        class AlwaysDetect(DetectionPlugin):
+            @property
+            def name(self):
+                return "always_detect"
+
+            def detect(self, session, client):
+                return DetectionResult(
+                    detected=True,
+                    reason="always detected",
+                    severity="high",
+                )
+
+        self.runner.registry.register_detection(AlwaysDetect(), priority=200)
         self.runner.max_restarts = 3
         self.runner.poll_interval = 0.1
 
@@ -203,13 +217,8 @@ class TestSkillRunnerUnit(unittest.TestCase):
 
     def test_run_timeout(self):
         """测试执行超时"""
-        self.runner.max_execution_time = 1
-        self.runner.poll_interval = 0.1
-
         mock_session = MagicMock()
         mock_session.session_id = "test-session-1"
-        mock_session.is_stuck.return_value = False
-        mock_session.is_done.return_value = False
         mock_session.get_progress.return_value = {
             "total": 3,
             "completed": 1,
@@ -222,6 +231,9 @@ class TestSkillRunnerUnit(unittest.TestCase):
             "test-session-1": {"state": "busy"}
         }
 
+        self.runner.max_execution_time = 0
+        self.runner.poll_interval = 0.1
+
         result = self.runner.run(
             skill_content="# Test Skill",
             user_request="Execute",
@@ -232,30 +244,18 @@ class TestSkillRunnerUnit(unittest.TestCase):
         assert "timed out" in result["error"]
 
     @patch.object(SkillRunner, "_create_session")
-    @patch.object(SkillRunner, "_restart_session")
     @patch.object(SkillRunner, "_all_todos_completed")
-    @patch.object(SkillRunner, "_verify_stable_completion")
+    @patch.object(SkillRunner, "_verify_completion")
     @patch.object(SkillRunner, "_get_progress")
     @patch.object(SkillRunner, "_get_todos")
-    @patch.object(SkillRunner, "_is_idle_but_incomplete")
-    def test_run_idle_incomplete(
-        self,
-        mock_idle,
-        mock_get_todos,
-        mock_get_progress,
-        mock_verify,
-        mock_all_done,
-        mock_restart,
-        mock_create,
+    def test_run_detection_restart_then_succeed(
+        self, mock_get_todos, mock_get_progress, mock_verify, mock_all_done, mock_create
     ):
-        """测试 idle 但 todos 未完成（偷懒检测）"""
+        """测试检测触发重启后最终成功"""
         mock_session1 = MagicMock()
         mock_session1.session_id = "test-session-1"
-        mock_session1.is_stuck.return_value = False
-
         mock_session2 = MagicMock()
         mock_session2.session_id = "test-session-2"
-        mock_session2.is_stuck.return_value = False
 
         call_count = [0]
 
@@ -277,19 +277,27 @@ class TestSkillRunnerUnit(unittest.TestCase):
             {"content": "t1", "status": "completed"},
             {"content": "t2", "status": "pending"},
         ]
-        mock_idle.side_effect = [True, False]
 
-        def restart_side_effect(*args, **kwargs):
-            self.runner.execution_log.append(
-                {
-                    "event": "restarted",
-                    "restart_count": 1,
-                    "timestamp": time.time(),
-                }
-            )
-            return mock_session2
+        class TriggerOnceDetector(DetectionPlugin):
+            def __init__(self):
+                self.triggered = False
 
-        mock_restart.side_effect = restart_side_effect
+            @property
+            def name(self):
+                return "trigger_once"
+
+            def detect(self, session, client):
+                if not self.triggered:
+                    self.triggered = True
+                    return DetectionResult(
+                        detected=True,
+                        reason="idle with incomplete todos",
+                        severity="high",
+                    )
+                return DetectionResult(detected=False)
+
+        detector = TriggerOnceDetector()
+        self.runner.registry.register_detection(detector, priority=200)
 
         self.runner.max_restarts = 3
         self.runner.poll_interval = 0.1
@@ -301,12 +309,10 @@ class TestSkillRunnerUnit(unittest.TestCase):
         )
 
         assert result["restart_count"] >= 1
-        assert any(
-            entry["event"] == "idle_incomplete" for entry in result["execution_log"]
-        )
+        assert result["status"] == "success"
 
-    def test_verify_stable_completion(self):
-        """测试稳定验证 - 通过"""
+    def test_verify_completion(self):
+        """测试通过插件验证完成"""
         mock_session = MagicMock()
         mock_session.session_id = "test-session-1"
         mock_session.get_progress.return_value = {
@@ -319,31 +325,19 @@ class TestSkillRunnerUnit(unittest.TestCase):
         self.mock_client.get_session_status.return_value = {
             "test-session-1": {"state": "idle"}
         }
+        self.mock_client.get_todo.return_value = [
+            {"id": "1", "content": "Task 1", "status": "completed"},
+            {"id": "2", "content": "Task 2", "status": "completed"},
+            {"id": "3", "content": "Task 3", "status": "completed"},
+        ]
+        self.mock_client.get_messages.return_value = [
+            {"info": {"role": "assistant"}},
+            {"info": {"role": "assistant"}},
+            {"info": {"role": "assistant"}},
+        ]
 
-        result = self.runner._verify_stable_completion()
-        assert result == True
-
-    def test_verify_stable_not_complete(self):
-        """测试稳定验证 - 不稳定"""
-        mock_session = MagicMock()
-        mock_session.session_id = "test-session-1"
-        call_count = [0]
-
-        def progress_side_effect():
-            call_count[0] += 1
-            if call_count[0] <= 1:
-                return {"total": 3, "completed": 3, "pending": 0, "percentage": 100.0}
-            else:
-                return {"total": 3, "completed": 2, "pending": 1, "percentage": 66.7}
-
-        mock_session.get_progress.side_effect = progress_side_effect
-        self.runner.session = mock_session
-        self.mock_client.get_session_status.return_value = {
-            "test-session-1": {"state": "idle"}
-        }
-
-        result = self.runner._verify_stable_completion()
-        assert result == False
+        result = self.runner._verify_completion()
+        assert result is True
 
     def test_get_progress_no_session(self):
         """测试无 session 时获取进度"""
@@ -372,27 +366,6 @@ class TestSkillRunnerUnit(unittest.TestCase):
         }
         assert self.runner._all_todos_completed() == False
 
-    def test_is_idle_but_incomplete(self):
-        """测试 idle 但未完成检测"""
-        mock_session = MagicMock()
-        mock_session.session_id = "test-session-1"
-        mock_session.get_progress.return_value = {
-            "total": 3,
-            "completed": 1,
-            "pending": 2,
-            "percentage": 33.3,
-        }
-        self.runner.session = mock_session
-        self.mock_client.get_session_status.return_value = {
-            "test-session-1": {"state": "idle"}
-        }
-        assert self.runner._is_idle_but_incomplete() == True
-
-        self.mock_client.get_session_status.return_value = {
-            "test-session-1": {"state": "busy"}
-        }
-        assert self.runner._is_idle_but_incomplete() == False
-
 
 class TestSkillRunnerEdgeCases(unittest.TestCase):
     """边界情况测试"""
@@ -411,8 +384,6 @@ class TestSkillRunnerEdgeCases(unittest.TestCase):
         """测试空 skill 内容"""
         mock_session = MagicMock()
         mock_session.session_id = "test-1"
-        mock_session.is_stuck.return_value = False
-        mock_session.is_done.return_value = False
         mock_session.get_progress.return_value = {
             "total": 0,
             "completed": 0,
@@ -422,36 +393,24 @@ class TestSkillRunnerEdgeCases(unittest.TestCase):
         self.runner.session = mock_session
 
         self.mock_client.get_session_status.return_value = {"test-1": {"state": "idle"}}
+        self.mock_client.get_todo.return_value = []
 
         result = self.runner.run("", "Execute", "empty-skill")
         assert result["status"] == "failed"
-        assert "timed out" in result["error"]
 
     @patch.object(SkillRunner, "_create_session")
-    @patch.object(SkillRunner, "_restart_session")
     @patch.object(SkillRunner, "_all_todos_completed")
-    @patch.object(SkillRunner, "_verify_stable_completion")
+    @patch.object(SkillRunner, "_verify_completion")
     @patch.object(SkillRunner, "_get_progress")
     @patch.object(SkillRunner, "_get_todos")
-    @patch.object(SkillRunner, "_is_idle_but_incomplete")
     def test_execution_log_records_events(
-        self,
-        mock_idle,
-        mock_get_todos,
-        mock_get_progress,
-        mock_verify,
-        mock_all_done,
-        mock_restart,
-        mock_create,
+        self, mock_get_todos, mock_get_progress, mock_verify, mock_all_done, mock_create
     ):
         """测试执行日志记录事件"""
         mock_session1 = MagicMock()
         mock_session1.session_id = "test-1"
-        mock_session1.is_stuck.side_effect = [True, False]
-
         mock_session2 = MagicMock()
         mock_session2.session_id = "test-2"
-        mock_session2.is_stuck.return_value = False
 
         call_count = [0]
 
@@ -472,19 +431,27 @@ class TestSkillRunnerEdgeCases(unittest.TestCase):
         mock_get_todos.return_value = [
             {"content": "t1", "status": "pending"},
         ]
-        mock_idle.return_value = False
 
-        def restart_side_effect(*args, **kwargs):
-            self.runner.execution_log.append(
-                {
-                    "event": "restarted",
-                    "restart_count": 1,
-                    "timestamp": time.time(),
-                }
-            )
-            return mock_session2
+        class TriggerOnceDetector(DetectionPlugin):
+            def __init__(self):
+                self.triggered = False
 
-        mock_restart.side_effect = restart_side_effect
+            @property
+            def name(self):
+                return "trigger_once"
+
+            def detect(self, session, client):
+                if not self.triggered:
+                    self.triggered = True
+                    return DetectionResult(
+                        detected=True,
+                        reason="test detection",
+                        severity="high",
+                    )
+                return DetectionResult(detected=False)
+
+        detector = TriggerOnceDetector()
+        self.runner.registry.register_detection(detector, priority=200)
 
         self.runner.poll_interval = 0.1
 
@@ -493,8 +460,8 @@ class TestSkillRunnerEdgeCases(unittest.TestCase):
         assert len(result["execution_log"]) > 0
         events = [e["event"] for e in result["execution_log"]]
         assert "started" in events
-        assert "stuck_detected" in events
-        assert "restarted" in events
+        assert "detection_triggered" in events
+        assert "recovered" in events
 
 
 if __name__ == "__main__":

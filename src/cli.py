@@ -14,12 +14,15 @@ import time
 import json
 import logging
 
-# Fix Windows console encoding - only apply when running as main script
-if sys.platform == "win32" and sys.stdout.isatty():
-    import io
+# Fix Windows console encoding
+if sys.platform == "win32":
+    import ctypes
 
-    sys.stdout.reconfigure(encoding="utf-8")
-    sys.stderr.reconfigure(encoding="utf-8")
+    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

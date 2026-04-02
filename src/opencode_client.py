@@ -242,7 +242,14 @@ class OpenCodeClient:
             f"Load and execute the skill '{skill_name}'. {user_request or ''}".strip()
         )
 
-        cmd = ["opencode", "run", "--agent", agent, "--attach", self.base_url, prompt]
+        # Find opencode executable (Windows uses .cmd)
+        import shutil
+
+        opencode_cmd = (
+            shutil.which("opencode.cmd") or shutil.which("opencode") or "opencode"
+        )
+
+        cmd = [opencode_cmd, "run", "--agent", agent, "--attach", self.base_url, prompt]
 
         logger.info(f"Running skill '{skill_name}' via opencode run")
         logger.info(f"Command: {' '.join(cmd)}")

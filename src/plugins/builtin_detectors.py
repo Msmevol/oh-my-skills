@@ -183,7 +183,13 @@ class SessionInvalidDetector(DetectionPlugin):
     - session 不存在（被删除或关闭）
     - 连接断开无法获取状态
     - session 被 abort
+
+    使用 get_session() 直接检查 session 是否存在，
+    而不是依赖 /session/status 列表（该列表可能有延迟或不包含所有 session）。
     """
+
+    def __init__(self, grace_period: int = 10):
+        self._grace_period = grace_period
 
     @property
     def name(self) -> str:
@@ -194,27 +200,35 @@ class SessionInvalidDetector(DetectionPlugin):
             return DetectionResult(detected=False)
 
         try:
-            all_status = client.get_session_status()
-            session_status = all_status.get(session.session_id)
+            # 直接获取 session 详情，而不是依赖 status 列表
+            session_info = client.get_session(session.session_id)
 
-            if session_status is None:
+            # 如果 get_session 成功返回数据，说明 session 存在
+            if session_info and isinstance(session_info, dict):
+                current_state = session_info.get("state", "unknown")
+                if current_state == "aborted":
+                    return DetectionResult(
+                        detected=True,
+                        reason="Session was aborted",
+                        severity="high",
+                        details={"state": current_state},
+                    )
+                return DetectionResult(detected=False)
+
+            # 宽限期：刚创建的 session 可能需要时间初始化
+            elapsed = time.time() - session.last_activity_time
+            if elapsed < self._grace_period:
                 return DetectionResult(
-                    detected=True,
-                    reason=f"Session {session.session_id} not found in status list",
-                    severity="critical",
-                    details={"session_id": session.session_id},
+                    detected=False,
+                    details={"grace_period": True, "elapsed": elapsed},
                 )
 
-            current_state = session_status.get("state", "unknown")
-            if current_state == "aborted":
-                return DetectionResult(
-                    detected=True,
-                    reason="Session was aborted",
-                    severity="high",
-                    details={"state": current_state},
-                )
-
-            return DetectionResult(detected=False)
+            return DetectionResult(
+                detected=True,
+                reason=f"Session {session.session_id} returned empty response (elapsed: {elapsed:.1f}s)",
+                severity="critical",
+                details={"session_id": session.session_id, "elapsed": elapsed},
+            )
 
         except Exception as e:
             error_str = str(e).lower()
@@ -233,5 +247,18 @@ class SessionInvalidDetector(DetectionPlugin):
                     details={"error": str(e)},
                 )
 
+            # 其他错误，给予宽限期
+            elapsed = time.time() - session.last_activity_time
+            if elapsed < self._grace_period:
+                return DetectionResult(
+                    detected=False,
+                    details={"grace_period": True, "elapsed": elapsed, "error": str(e)},
+                )
+
             logger.error(f"SessionInvalidDetector error: {e}")
-            return DetectionResult(detected=False)
+            return DetectionResult(
+                detected=True,
+                reason=f"Session check error: {e}",
+                severity="high",
+                details={"error": str(e)},
+            )

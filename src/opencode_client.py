@@ -89,8 +89,12 @@ class OpenCodeClient:
         agent: Optional[str] = None,
         model: Optional[str] = None,
     ) -> dict:
-        """发送消息并等待响应"""
-        body = {"message": message}
+        """发送消息并等待响应
+
+        API 格式: POST /session/{id}/message
+        Body: {"parts": [{"type": "text", "text": "..."}], "agent": "...", "model": "..."}
+        """
+        body = {"parts": [{"type": "text", "text": message}]}
         if agent:
             body["agent"] = agent
         if model:
@@ -106,7 +110,7 @@ class OpenCodeClient:
         self, session_id: str, message: str, agent: Optional[str] = None
     ) -> None:
         """异步发送消息（不等待响应）"""
-        body = {"message": message}
+        body = {"parts": [{"type": "text", "text": message}]}
         if agent:
             body["agent"] = agent
 

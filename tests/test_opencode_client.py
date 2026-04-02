@@ -65,7 +65,7 @@ class TestOpenCodeClient:
         assert result == {"status": "ok"}
 
         call_args = mock_request.call_args
-        assert call_args.kwargs["json"]["message"] == "hello"
+        assert call_args.kwargs["json"]["parts"] == [{"type": "text", "text": "hello"}]
         assert call_args.kwargs["json"]["agent"] == "planner"
 
     @patch("src.opencode_client.requests.Session.request")

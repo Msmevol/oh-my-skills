@@ -202,19 +202,20 @@ class TestPrematureEndDetector:
 
 class TestSessionInvalidDetector:
     def test_detects_missing_session(self):
-        detector = SessionInvalidDetector()
+        detector = SessionInvalidDetector(grace_period=0)
         session = make_session()
-        client = make_client()
-        client.get_session_status.return_value = {}
+        client = MagicMock()
+        client.get_session.return_value = {}
         result = detector.detect(session, client)
         assert result.detected is True
-        assert "not found" in result.reason.lower()
+        assert "empty response" in result.reason.lower()
         assert result.severity == "critical"
 
     def test_detects_aborted_session(self):
         detector = SessionInvalidDetector()
         session = make_session()
-        client = make_client(state="aborted")
+        client = MagicMock()
+        client.get_session.return_value = {"state": "aborted"}
         result = detector.detect(session, client)
         assert result.detected is True
         assert "aborted" in result.reason.lower()
@@ -223,29 +224,75 @@ class TestSessionInvalidDetector:
     def test_no_detect_when_valid(self):
         detector = SessionInvalidDetector()
         session = make_session()
-        client = make_client(state="idle")
+        client = MagicMock()
+        client.get_session.return_value = {"state": "idle"}
         result = detector.detect(session, client)
         assert result.detected is False
 
     def test_handles_404_error(self):
         detector = SessionInvalidDetector()
         session = make_session()
-        client = make_client()
-        client.get_session_status.side_effect = Exception("404 Not Found")
+        client = MagicMock()
+        client.get_session.side_effect = Exception("404 Not Found")
         result = detector.detect(session, client)
         assert result.detected is True
 
     def test_handles_connection_error(self):
         detector = SessionInvalidDetector()
         session = make_session()
-        client = make_client()
-        client.get_session_status.side_effect = ConnectionError("Connection refused")
+        client = MagicMock()
+        client.get_session.side_effect = ConnectionError("Connection refused")
         result = detector.detect(session, client)
         assert result.detected is True
 
     def test_no_session_id(self):
         detector = SessionInvalidDetector()
         session = make_session(session_id=None)
-        client = make_client()
+        client = MagicMock()
+        result = detector.detect(session, client)
+        assert result.detected is False
+
+    def test_grace_period(self):
+        import time
+
+        detector = SessionInvalidDetector(grace_period=10)
+        session = make_session()
+        session.last_activity_time = time.time() - 2
+        client = MagicMock()
+        client.get_session.return_value = {}
+        result = detector.detect(session, client)
+        assert result.detected is False
+
+    def test_handles_404_error(self):
+        detector = SessionInvalidDetector()
+        session = make_session()
+        client = MagicMock()
+        client.get_session.side_effect = Exception("404 Not Found")
+        result = detector.detect(session, client)
+        assert result.detected is True
+
+    def test_handles_connection_error(self):
+        detector = SessionInvalidDetector()
+        session = make_session()
+        client = MagicMock()
+        client.get_session.side_effect = ConnectionError("Connection refused")
+        result = detector.detect(session, client)
+        assert result.detected is True
+
+    def test_no_session_id(self):
+        detector = SessionInvalidDetector()
+        session = make_session(session_id=None)
+        client = MagicMock()
+        result = detector.detect(session, client)
+        assert result.detected is False
+
+    def test_grace_period(self):
+        import time
+
+        detector = SessionInvalidDetector(grace_period=10)
+        session = make_session()
+        session.last_activity_time = time.time() - 2
+        client = MagicMock()
+        client.get_session.return_value = {}
         result = detector.detect(session, client)
         assert result.detected is False

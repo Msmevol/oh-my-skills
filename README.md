@@ -79,6 +79,7 @@
 ## 安装
 
 ```bash
+cd multi-agent-orchestrator
 pip install -r requirements.txt
 ```
 
@@ -90,16 +91,103 @@ pip install -r requirements.txt
 
 ## 使用
 
-```bash
-# 运行完整工作流
-python main.py "实现一个用户注册功能，包括前端表单和后端 API"
+### 运行完整工作流
 
-# 或直接运行单元测试
+```bash
+python main.py "实现一个用户注册功能，包括前端表单和后端 API"
+```
+
+### 运行 Skill Runner（插件化模式）
+
+```python
+from src.opencode_client import OpenCodeClient
+from src.skill_runner import SkillRunner
+
+# 1. 连接 opencode serve
+client = OpenCodeClient("http://localhost:4096")
+
+# 2. 创建 SkillRunner
+runner = SkillRunner(
+    client=client,
+    agent_name="skill-executor",
+    max_restarts=3,           # 最大重启次数
+    stuck_threshold=120,      # 卡死检测阈值（秒）
+    max_execution_time=600,   # 最大执行时间（秒）
+    poll_interval=5,          # 轮询间隔（秒）
+    verification_stable_count=2,  # 稳定完成验证次数
+)
+
+# 3. 执行 skill
+skill_content = """---
+name: my-skill
+description: "我的 skill 描述"
+---
+
+# Skill 内容
+
+## 步骤
+1. 使用 todowrite 创建任务
+2. 逐个执行任务
+3. 汇报结果
+"""
+
+result = runner.run(
+    skill_content=skill_content,
+    user_request="执行我的 skill",
+    skill_name="my-skill",
+)
+
+print(f"状态: {result['status']}")
+print(f"进度: {result['progress']}")
+print(f"Todos: {result['todos']}")
+```
+
+### 启动 opencode serve
+
+```bash
+# 启动 headless server
+opencode serve --port 4096 --hostname localhost
+
+# 或使用 web 界面
+opencode web --port 4096
+```
+
+## 测试
+
+### 运行全部测试
+
+```bash
+# 全部测试（146 个，约 71 秒）
 pytest tests/ -v
 
-# 只跑快速测试（不需要 opencode）
-pytest tests/ -v -m "not slow"
+# 只跑单元测试（不需要 opencode server）
+pytest tests/test_opencode_client.py tests/test_agent_session.py tests/test_skill_runner.py tests/plugins/ -v
+
+# 只跑插件测试
+pytest tests/plugins/ -v
+
+# 带日志输出
+pytest tests/plugins/ -v -s
+
+# 带超时控制
+pytest tests/ -v --timeout=600
 ```
+
+### 测试覆盖
+
+| 测试类型 | 数量 | 状态 |
+|----------|------|------|
+| 插件单元测试 | 56 | ✅ 全部通过 |
+| 插件集成测试 | 40 | ✅ 全部通过 |
+| 客户端/会话/运行器单元测试 | 50 | ✅ 全部通过 |
+| **总计** | **146** | **✅ 全部通过** |
+
+### 测试日志
+
+测试日志保存在 `test_logs/` 目录：
+- `integration_YYYYMMDD_HHMMSS.log` - 集成测试日志
+- `e2e_YYYYMMDD_HHMMSS.log` - E2E 测试日志
+- `pytest.log` - pytest 统一日志
 
 ## 项目结构
 
@@ -122,38 +210,23 @@ pytest tests/ -v -m "not slow"
 │       ├── builtin_recovery.py     #   内置恢复插件
 │       └── builtin_verification.py #   内置验证插件
 ├── tests/
-│   ├── test_opencode_client.py
-│   ├── test_agent_session.py
-│   ├── test_skill_runner.py
-│   ├── test_skill_integration.py
-│   ├── test_skill_e2e.py
-│   └── plugins/               # 插件测试
-│       ├── test_plugin_framework.py
-│       ├── test_detectors.py
-│       ├── test_recovery.py
-│       └── test_verification.py
+│   ├── test_opencode_client.py      # 客户端测试 (17)
+│   ├── test_agent_session.py        # 会话测试 (20)
+│   ├── test_skill_runner.py         # 运行器测试 (12)
+│   ├── test_skill_integration.py    # 集成测试 (5)
+│   ├── test_skill_e2e.py            # E2E 测试 (4)
+│   └── plugins/                     # 插件测试 (88)
+│       ├── test_plugin_framework.py #   框架测试 (12)
+│       ├── test_detectors.py        #   检测插件测试 (22)
+│       ├── test_recovery.py         #   恢复插件测试 (8)
+│       ├── test_verification.py     #   验证插件测试 (13)
+│       ├── test_plugin_integration.py          # 插件集成测试 (40)
+│       └── test_skill_runner_plugin_integration.py  # SkillRunner 插件集成测试 (16)
 ├── config.py                  # 配置项
 ├── main.py                    # 入口
-└── requirements.txt
-```
-
-## 测试
-
-```bash
-# 全部测试
-pytest tests/ -v
-
-# 只跑单元测试（不需要 opencode）
-pytest tests/test_opencode_client.py tests/test_agent_session.py tests/plugins/ -v
-
-# 插件框架测试
-pytest tests/plugins/ -v
-
-# 集成测试（需要 mock server）
-pytest tests/test_integration.py -v
-
-# E2E 测试（标记为 slow）
-pytest tests/test_e2e.py -v -m slow
+├── pytest.ini                 # pytest 配置
+├── requirements.txt           # 依赖
+└── test_logs/                 # 测试日志目录
 ```
 
 ## 插件开发指南
@@ -179,11 +252,104 @@ class MyDetector(DetectionPlugin):
         return DetectionResult(detected=False)
 ```
 
+### 创建自定义恢复插件
+
+```python
+from src.plugins import RecoveryPlugin
+
+class MyRecovery(RecoveryPlugin):
+    @property
+    def name(self) -> str:
+        return "my_recovery"
+
+    def recover(self, session, client, context):
+        # 恢复逻辑
+        # 返回新的 session 或 None
+        new_session = client.create_session("recovery-session")
+        client.send_message(new_session["id"], "继续执行")
+        return new_session
+```
+
+### 创建自定义验证插件
+
+```python
+from src.plugins import VerificationPlugin
+
+class MyVerification(VerificationPlugin):
+    @property
+    def name(self) -> str:
+        return "my_verification"
+
+    def verify(self, session, client) -> bool:
+        # 验证逻辑
+        todos = client.get_todo(session.session_id)
+        return all(t.get("status") == "completed" for t in todos)
+```
+
 ### 注册插件
 
 ```python
 from src.skill_runner import SkillRunner
 
 runner = SkillRunner(client=client)
+
+# 注册检测插件（priority 越大越先执行）
 runner.registry.register_detection(MyDetector(), priority=100)
+
+# 注册恢复插件
+runner.registry.register_recovery(MyRecovery(), priority=50)
+
+# 注册验证插件
+runner.registry.register_verification(MyVerification(), priority=10)
+```
+
+## 配置参数说明
+
+### SkillRunner 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `client` | - | OpenCodeClient 实例 |
+| `agent_name` | - | Agent 名称 |
+| `max_restarts` | 3 | 最大重启次数 |
+| `stuck_threshold` | 120 | 卡死检测阈值（秒） |
+| `max_execution_time` | 600 | 最大执行时间（秒） |
+| `poll_interval` | 5 | 轮询间隔（秒） |
+| `verification_stable_count` | 2 | 稳定完成验证次数 |
+
+### pytest.ini 配置
+
+| 配置项 | 值 | 说明 |
+|--------|-----|------|
+| `timeout` | 600 | 测试超时时间（秒） |
+| `log_cli` | true | 控制台实时日志 |
+| `log_cli_level` | INFO | 控制台日志级别 |
+| `log_file` | test_logs/pytest.log | 日志文件路径 |
+| `log_file_level` | DEBUG | 文件日志级别 |
+
+## 常见问题
+
+### Q: 测试失败怎么办？
+
+A: 检查以下几点：
+1. 确保 `opencode serve` 正在运行（集成/E2E 测试需要）
+2. 检查日志文件 `test_logs/` 中的详细输出
+3. 只跑单元测试：`pytest tests/test_opencode_client.py tests/test_agent_session.py tests/plugins/ -v`
+
+### Q: 如何添加自定义检测逻辑？
+
+A: 创建自定义检测插件并注册到 SkillRunner：
+```python
+runner.registry.register_detection(MyDetector(), priority=100)
+```
+
+### Q: 如何调整超时时间？
+
+A: 修改 SkillRunner 初始化参数：
+```python
+runner = SkillRunner(
+    client=client,
+    max_execution_time=300,  # 改为 5 分钟
+    stuck_threshold=60,      # 改为 1 分钟
+)
 ```

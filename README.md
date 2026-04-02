@@ -97,6 +97,75 @@ pip install -r requirements.txt
 python main.py "实现一个用户注册功能，包括前端表单和后端 API"
 ```
 
+### 运行 Skill Runner CLI（推荐）
+
+使用标准 opencode skill 格式，支持自动发现和独立执行：
+
+```bash
+# 执行 skill（自动查找 .opencode/skills/<name>/SKILL.md）
+python -m src.cli code-mr-ci-loop "创建MR"
+
+# 列出所有可用 skills
+python -m src.cli --list
+
+# JSON 输出格式（用于脚本集成）
+python -m src.cli code-mr-ci-loop "创建MR" --format json
+
+# 指定 opencode server 地址
+python -m src.cli code-mr-ci-loop "创建MR" --url http://localhost:4096
+
+# 指定工作目录
+python -m src.cli code-mr-ci-loop "创建MR" --dir D:/my-project
+```
+
+### 打包成独立 exe
+
+```bash
+# 安装依赖
+pip install -r requirements.txt
+pip install pyinstaller
+
+# 打包
+build.bat
+
+# 使用独立 exe
+dist\skill-runner\skill-runner.exe code-mr-ci-loop "创建MR"
+dist\skill-runner\skill-runner.exe --list
+```
+
+### 标准 Skill 格式
+
+Skill 文件必须遵循标准 opencode 格式：
+
+```
+.opencode/skills/<name>/SKILL.md
+```
+
+**SKILL.md 示例：**
+
+```markdown
+---
+name: code-mr-ci-loop
+description: Create MR and manage CI/CD pipeline
+license: MIT
+---
+
+# Code MR CI Loop
+
+## What I do
+- Create merge requests
+- Monitor CI/CD pipeline
+- Handle failures automatically
+
+## When to use me
+Use this when you need to create and manage MRs.
+```
+
+**Skill name 规则：**
+- 小写字母 + 连字符：`^[a-z0-9]+(-[a-z0-9]+)*$`
+- 不能以 `-` 开头或结尾
+- 不能包含连续 `--`
+
 ### 运行 Skill Runner（插件化模式）
 
 ```python
@@ -204,6 +273,8 @@ pytest tests/ -v --timeout=600
 │   ├── agent_session.py       # Session 生命周期管理
 │   ├── orchestrator.py        # 主编排器
 │   ├── skill_runner.py        # Skill 执行器（插件化架构）
+│   ├── skill_loader.py        # Skill 查找和解析（标准格式）
+│   ├── cli.py                 # CLI 入口（skill-runner）
 │   └── plugins/               # Python 插件框架（方案 B）
 │       ├── __init__.py        #   PluginRegistry, 基类定义
 │       ├── builtin_detectors.py    #   内置检测插件
@@ -213,6 +284,8 @@ pytest tests/ -v --timeout=600
 │   ├── test_opencode_client.py      # 客户端测试 (17)
 │   ├── test_agent_session.py        # 会话测试 (20)
 │   ├── test_skill_runner.py         # 运行器测试 (12)
+│   ├── test_skill_loader.py         # Skill 加载测试 (10)
+│   ├── test_cli.py                  # CLI 测试 (8)
 │   ├── test_skill_integration.py    # 集成测试 (5)
 │   ├── test_skill_e2e.py            # E2E 测试 (4)
 │   └── plugins/                     # 插件测试 (88)
@@ -224,6 +297,8 @@ pytest tests/ -v --timeout=600
 │       └── test_skill_runner_plugin_integration.py  # SkillRunner 插件集成测试 (16)
 ├── config.py                  # 配置项
 ├── main.py                    # 入口
+├── build.bat                  # Windows 构建脚本
+├── build.spec                 # PyInstaller 配置
 ├── pytest.ini                 # pytest 配置
 ├── requirements.txt           # 依赖
 └── test_logs/                 # 测试日志目录

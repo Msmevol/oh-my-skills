@@ -5,6 +5,9 @@ OpenCode HTTP API Client
 
 import logging
 import time
+import subprocess
+import json
+import os
 from typing import Optional
 
 import requests
@@ -202,3 +205,98 @@ class OpenCodeClient:
     def get_diff(self, session_id: str) -> list:
         """获取 session 产生的文件 diff"""
         return self._request("GET", f"/session/{session_id}/diff")
+
+    def run_skill(
+        self,
+        skill_name: str,
+        user_request: str,
+        agent: str = "skill-executor",
+        timeout: int = 600,
+        working_dir: Optional[str] = None,
+    ) -> dict:
+        """使用 opencode run 子进程执行 skill
+
+        流程:
+        1. 启动 opencode run --agent <agent> --attach <url> "<prompt>"
+        2. 捕获 stdout/stderr
+        3. 解析输出
+        4. 返回执行结果
+
+        Args:
+            skill_name: skill 名称
+            user_request: 用户请求
+            agent: agent 名称
+            timeout: 超时时间（秒）
+            working_dir: 工作目录
+
+        Returns:
+            {
+                "status": "success" | "failed",
+                "stdout": "...",
+                "stderr": "...",
+                "returncode": int,
+                "error": "..." (if failed)
+            }
+        """
+        prompt = (
+            f"Load and execute the skill '{skill_name}'. {user_request or ''}".strip()
+        )
+
+        cmd = ["opencode", "run", "--agent", agent, "--attach", self.base_url, prompt]
+
+        logger.info(f"Running skill '{skill_name}' via opencode run")
+        logger.info(f"Command: {' '.join(cmd)}")
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=working_dir,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+
+            output = {
+                "status": "success" if result.returncode == 0 else "failed",
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode,
+                "error": None,
+            }
+
+            if result.returncode != 0:
+                output["error"] = result.stderr or f"Exit code: {result.returncode}"
+
+            logger.info(
+                f"Skill '{skill_name}' completed with status: {output['status']}"
+            )
+            return output
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"Skill '{skill_name}' timed out after {timeout}s")
+            return {
+                "status": "failed",
+                "stdout": "",
+                "stderr": "",
+                "returncode": -1,
+                "error": f"Execution timed out after {timeout}s",
+            }
+        except FileNotFoundError:
+            logger.error("opencode command not found in PATH")
+            return {
+                "status": "failed",
+                "stdout": "",
+                "stderr": "",
+                "returncode": -1,
+                "error": "opencode command not found. Make sure opencode is installed and in PATH.",
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error running skill '{skill_name}': {e}")
+            return {
+                "status": "failed",
+                "stdout": "",
+                "stderr": "",
+                "returncode": -1,
+                "error": f"Unexpected error: {e}",
+            }

@@ -146,6 +146,7 @@ class SkillRunner:
         }
 
         restart_count = 0
+        self.execution_log.clear()
 
         try:
             prompt = self._build_prompt(skill_content, user_request)
@@ -222,6 +223,7 @@ class SkillRunner:
                             "restart_count": restart_count,
                             "detection_result": detection_result,
                             "skill_name": skill_name,
+                            "skill_content": skill_content,
                         },
                     )
 
@@ -293,7 +295,13 @@ class SkillRunner:
             f"5. 不要提前结束，确保所有任务都完成\n"
             f"6. 如果 skill 需要用户确认，使用 question 工具\n"
             f"7. 如果遇到困难，尝试多种方法解决，不要跳过\n"
-            f"8. 所有任务完成后，汇报最终结果"
+            f"8. 所有任务完成后，汇报最终结果\n\n"
+            f"## 重要提醒\n\n"
+            f"- 每个任务必须按照: pending → in_progress → completed 的顺序执行\n"
+            f"- 禁止跳过 in_progress 状态直接从 pending 改为 completed\n"
+            f"- 每次调用 todowrite 最多只能将 2 个任务标记为 completed\n"
+            f"- 如果你尝试一次完成超过 2 个任务，工具调用会被拒绝\n"
+            f"- 必须确保每个任务都真正完成了才能标记为 completed"
         )
 
     def _create_session(self, skill_name: str) -> AgentSession:

@@ -2,15 +2,18 @@
 Built-in Detection Plugins - 内置检测插件
 
 提供四种核心检测能力：
-1. StuckDetector - 卡死检测（busy 超时、error 状态）
+1. StuckDetector - 卡死检测（busy 超时、retry 超时）
 2. IdleIncompleteDetector - 偷懒检测（idle 但 todos 未完成）
-3. PrematureEndDetector - 提前结束检测（done/completed 但 todos 未完成）
+3. PrematureEndDetector - 提前结束检测（session 从 status 消失但 todos 未完成）
 4. SessionInvalidDetector - 会话失效检测（session 不存在、连接断开）
+
+注意：OpenCode API /session/status 返回 {session_id: {type: "busy"|"idle"|"retry"}}
+不存在 done/error/completed 等状态。session 执行完成后会从 status 列表中消失。
 """
 
 import logging
 import time
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from . import DetectionPlugin, DetectionResult
 
@@ -21,8 +24,8 @@ class StuckDetector(DetectionPlugin):
     """卡死检测插件
 
     检测场景：
-    1. session 状态为 error
-    2. session 状态为 busy 且超过阈值时间
+    1. session 状态为 busy 且超过阈值时间
+    2. session 状态为 retry 且超过阈值时间（持续重试视为卡死）
     """
 
     def __init__(self, timeout: int = 300):
@@ -39,17 +42,25 @@ class StuckDetector(DetectionPlugin):
         try:
             all_status = client.get_session_status()
             session_status = all_status.get(session.session_id, {})
-            current_state = session_status.get("state", "unknown")
+            current_type = session_status.get("type", "unknown")
 
-            if current_state == "error":
-                return DetectionResult(
-                    detected=True,
-                    reason=f"Session in error state",
-                    severity="high",
-                    details={"state": current_state},
-                )
+            # retry 状态（持续重试视为卡死）
+            if current_type == "retry":
+                elapsed = time.time() - session.last_activity_time
+                if elapsed > self._timeout:
+                    retry_msg = session_status.get("message", "")
+                    return DetectionResult(
+                        detected=True,
+                        reason=f"Session in retry for {elapsed:.0f}s: {retry_msg}",
+                        severity="medium",
+                        details={
+                            "type": current_type,
+                            "elapsed": elapsed,
+                            "threshold": self._timeout,
+                        },
+                    )
 
-            if current_state == "busy":
+            if current_type == "busy":
                 elapsed = time.time() - session.last_activity_time
                 if elapsed > self._timeout:
                     return DetectionResult(
@@ -57,7 +68,7 @@ class StuckDetector(DetectionPlugin):
                         reason=f"Session busy for {elapsed:.0f}s (threshold: {self._timeout}s)",
                         severity="medium",
                         details={
-                            "state": current_state,
+                            "type": current_type,
                             "elapsed": elapsed,
                             "threshold": self._timeout,
                         },
@@ -84,6 +95,7 @@ class IdleIncompleteDetector(DetectionPlugin):
     检测场景：
     - session 状态为 idle
     - 但还有未完成的 todos
+    - 分析消息历史，确认是否所有任务都被尝试执行过
     """
 
     @property
@@ -97,9 +109,9 @@ class IdleIncompleteDetector(DetectionPlugin):
         try:
             all_status = client.get_session_status()
             session_status = all_status.get(session.session_id, {})
-            current_state = session_status.get("state", "unknown")
+            current_type = session_status.get("type", "unknown")
 
-            if current_state != "idle":
+            if current_type != "idle":
                 return DetectionResult(detected=False)
 
             todos = client.get_todo(session.session_id)
@@ -108,12 +120,34 @@ class IdleIncompleteDetector(DetectionPlugin):
 
             incomplete = [t for t in todos if t.get("status") != "completed"]
             if incomplete:
+                logger.warning(
+                    f"IdleIncompleteDetector: detected idle state with {len(incomplete)} "
+                    f"incomplete todos out of {len(todos)} total"
+                )
+
+                messages = client.get_messages(session.session_id, limit=100)
+                attempt_analysis = self._analyze_task_attempts(incomplete, messages)
+
+                if attempt_analysis["unattempted_count"] > 0:
+                    return DetectionResult(
+                        detected=True,
+                        reason=f"Session idle with {len(incomplete)} incomplete todos, "
+                        f"{attempt_analysis['unattempted_count']} tasks never attempted",
+                        severity="high",
+                        details={
+                            "type": current_type,
+                            "incomplete_count": len(incomplete),
+                            "total_count": len(todos),
+                            "unattempted": attempt_analysis["unattempted"],
+                        },
+                    )
+
                 return DetectionResult(
                     detected=True,
                     reason=f"Session idle with {len(incomplete)} incomplete todos",
-                    severity="high",
+                    severity="medium",
                     details={
-                        "state": current_state,
+                        "type": current_type,
                         "incomplete_count": len(incomplete),
                         "total_count": len(todos),
                     },
@@ -125,15 +159,58 @@ class IdleIncompleteDetector(DetectionPlugin):
             logger.error(f"IdleIncompleteDetector error: {e}")
             return DetectionResult(detected=False)
 
+    def _analyze_task_attempts(
+        self, incomplete_todos: List[Dict], messages: List[Dict]
+    ) -> Dict:
+        """分析每个未完成任务是否被尝试执行过"""
+        tool_calls = []
+        for m in messages:
+            parts = m.get("parts", [])
+            for p in parts:
+                if p.get("type") == "tool":
+                    tool_calls.append(p)
+
+        attempted_content = set()
+        for tc in tool_calls:
+            state = tc.get("state", {})
+            input_args = state.get("input", {})
+            call_todos = input_args.get("todos", [])
+            if call_todos:
+                for td in call_todos:
+                    if td.get("id"):
+                        attempted_content.add(td.get("id"))
+
+        unattempted = []
+        for td in incomplete_todos:
+            if td.get("id") not in attempted_content:
+                unattempted.append(td.get("content", "unknown")[:50])
+
+        return {
+            "unattempted_count": len(unattempted),
+            "unattempted": unattempted,
+        }
+
 
 class PrematureEndDetector(DetectionPlugin):
     """提前结束检测插件
 
     检测场景：
-    - session 状态为 done/completed
+    - session 从 /session/status 列表中消失（意味着已完成或被清理）
     - 但还有未完成的 todos
-    - 这是小模型最常见的问题：自作主张提前结束
+    - 这是小模型最常见的问题：模型停止执行但任务没做完
+
+    增强检测：
+    - 分析消息历史，确认每个任务是否都有对应的执行步骤
+    - 检测是否存在跳过的任务（未尝试就标记完成）
+    - 检查任务执行步骤与任务数量是否匹配
+
+    注意：OpenCode API 没有 done/completed 状态，
+    session 执行完成或停止后会从 status 列表中移除。
     """
+
+    def __init__(self, grace_period: int = 45, min_steps_per_task: int = 2):
+        self._grace_period = grace_period
+        self._min_steps_per_task = min_steps_per_task
 
     @property
     def name(self) -> str:
@@ -144,12 +221,13 @@ class PrematureEndDetector(DetectionPlugin):
             return DetectionResult(detected=False)
 
         try:
-            all_status = client.get_session_status()
-            session_status = all_status.get(session.session_id, {})
-            current_state = session_status.get("state", "unknown")
+            elapsed = time.time() - session.last_activity_time
+            if elapsed < self._grace_period:
+                return DetectionResult(detected=False)
 
-            end_states = {"done", "completed", "finished"}
-            if current_state.lower() not in end_states:
+            all_status = client.get_session_status()
+
+            if session.session_id in all_status:
                 return DetectionResult(detected=False)
 
             todos = client.get_todo(session.session_id)
@@ -160,20 +238,60 @@ class PrematureEndDetector(DetectionPlugin):
             if incomplete:
                 return DetectionResult(
                     detected=True,
-                    reason=f"Session ended ({current_state}) with {len(incomplete)} incomplete todos",
+                    reason=f"Session disappeared from status with {len(incomplete)} incomplete todos (elapsed: {elapsed:.0f}s)",
                     severity="critical",
                     details={
-                        "state": current_state,
                         "incomplete_count": len(incomplete),
                         "total_count": len(todos),
+                        "elapsed": elapsed,
                     },
                 )
+
+            completed = [t for t in todos if t.get("status") == "completed"]
+            if completed:
+                messages = client.get_messages(session.session_id, limit=100)
+                if not self._verify_tasks_executed(completed, messages):
+                    return DetectionResult(
+                        detected=True,
+                        reason=f"Session completed but tasks may have been skipped - incomplete execution detected",
+                        severity="high",
+                        details={
+                            "completed_count": len(completed),
+                            "verification": "task_execution_mismatch",
+                        },
+                    )
 
             return DetectionResult(detected=False)
 
         except Exception as e:
             logger.error(f"PrematureEndDetector error: {e}")
             return DetectionResult(detected=False)
+
+    def _verify_tasks_executed(
+        self, completed_todos: List[Dict], messages: List[Dict]
+    ) -> bool:
+        """验证任务是否真正被执行
+
+        检查每个已完成的任务是否在消息历史中有对应的执行步骤
+        """
+        if not completed_todos or not messages:
+            return True
+
+        tool_calls = []
+        for m in messages:
+            parts = m.get("parts", [])
+            for p in parts:
+                if p.get("type") == "tool":
+                    tool_calls.append(p)
+
+        if len(tool_calls) < len(completed_todos) * self._min_steps_per_task:
+            logger.warning(
+                f"PrematureEndDetector: too few tool calls ({len(tool_calls)}) "
+                f"for {len(completed_todos)} completed tasks"
+            )
+            return False
+
+        return True
 
 
 class SessionInvalidDetector(DetectionPlugin):
@@ -182,10 +300,9 @@ class SessionInvalidDetector(DetectionPlugin):
     检测场景：
     - session 不存在（被删除或关闭）
     - 连接断开无法获取状态
-    - session 被 abort
 
     使用 get_session() 直接检查 session 是否存在，
-    而不是依赖 /session/status 列表（该列表可能有延迟或不包含所有 session）。
+    与 PrematureEndDetector（检查 status 列表）互补。
     """
 
     def __init__(self, grace_period: int = 10):
@@ -205,14 +322,6 @@ class SessionInvalidDetector(DetectionPlugin):
 
             # 如果 get_session 成功返回数据，说明 session 存在
             if session_info and isinstance(session_info, dict):
-                current_state = session_info.get("state", "unknown")
-                if current_state == "aborted":
-                    return DetectionResult(
-                        detected=True,
-                        reason="Session was aborted",
-                        severity="high",
-                        details={"state": current_state},
-                    )
                 return DetectionResult(detected=False)
 
             # 宽限期：刚创建的 session 可能需要时间初始化

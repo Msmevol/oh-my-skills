@@ -6,6 +6,8 @@
  * 2. SKIP_IN_PROGRESS: 自动修正为 in_progress 并放行（存在合理场景）
  * 3. MULTI_COMPLETE: 一次调用中批量完成超过阈值个 pending 任务 → throw 强制阻断
  * 4. 记录所有 todowrite 操作历史
+ * 5. 渐进式阻断 - 首次违规警告，后续阻断
+ * 6. 详细的错误消息 - 包含具体任务 ID
  *
  * 解决的问题：
  * - 模型一次性把所有 pending 任务标记为 completed（作弊）
@@ -17,6 +19,7 @@
  *   但任务实际上确实执行了。throw 会消耗 reasoning step 且模型可能不理解错误。
  * - MULTI_COMPLETE 才 throw：一次完成多个任务几乎不可能是正常行为，
  *   且错误消息中包含明确指令，模型可以理解并重试。
+ * - 渐进式阻断：累计 2 次违规后才会阻断，给模型改进机会
  * - throw 前 history 已记录（在 validateTodoChange 之前调用 recordViolation），
  *   确保 throw 后 tool.execute.after 不触发也不影响历史连续性。
  */
@@ -26,11 +29,20 @@ const TODOS_HISTORY = new Map();
 /** 一次调用中最多允许完成的 pending 任务数 */
 const MAX_BATCH_COMPLETE = 2;
 
+/** 累计违规次数阈值，超过后阻断 */
+const MAX_CUMULATIVE_VIOLATIONS = 2;
+
 function getTodosHistory(sessionID) {
   if (!TODOS_HISTORY.has(sessionID)) {
     TODOS_HISTORY.set(sessionID, []);
   }
   return TODOS_HISTORY.get(sessionID);
+}
+
+/** 获取累计违规次数 */
+function getCumulativeViolations(sessionID) {
+  const history = getTodosHistory(sessionID);
+  return history.filter(h => h.type === 'violation_blocked').length;
 }
 
 function recordTodoChange(sessionID, change) {
@@ -128,23 +140,64 @@ export const TodoValidatorPlugin = async ({ client, directory }) => {
         args: output.args,
       });
 
-      if (hasMultiComplete) {
-        // MULTI_COMPLETE: 严重作弊 → throw 强制阻断
+      // 渐进式阻断：检查累计违规次数
+      const cumulativeViolations = getCumulativeViolations(sessionID);
+
+      if (hasMultiComplete && cumulativeViolations >= MAX_CUMULATIVE_VIOLATIONS) {
+        // 累计违规超过阈值 → 强制阻断
         const multiV = violations.find((v) => v.type === "MULTI_COMPLETE");
+        const correctedTaskIds = corrections.map(c => c.todoId);
+        
         client.app.log({
           body: {
             service: "todo-validator",
             level: "error",
-            message: `BLOCKED: batch completion of ${multiV.count} tasks in session ${sessionID}`,
-            extra: { sessionID, violations },
+            message: `BLOCKED: batch completion of ${multiV.count} tasks (cumulative violations: ${cumulativeViolations}) in session ${sessionID}`,
+            extra: { sessionID, violations, cumulativeViolations },
           },
         });
 
         throw new Error(
-          `违规：一次最多完成 ${MAX_BATCH_COMPLETE} 个任务，你尝试完成 ${multiV.count} 个。` +
-            `请重新调用 todowrite，只将你实际已完成的任务标记为 completed，` +
-            `其余任务必须先标记为 in_progress。`,
+          `违规：你已累计违规 ${cumulativeViolations} 次。\n` +
+          `本次你尝试一次完成 ${multiV.count} 个任务（最多允许 ${MAX_BATCH_COMPLETE} 个）。\n\n` +
+          `需要修改的任务 ID: ${correctedTaskIds.join(', ')}\n\n` +
+          `正确做法：\n` +
+          `1. 先将这些任务的 status 改为 "in_progress"\n` +
+          `2. 逐个完成每个任务后再将 status 改为 "completed"\n` +
+          `3. 每次调用 todowrite 最多只能修改 ${MAX_BATCH_COMPLETE} 个任务`
         );
+      }
+
+      // 累计违规未超过阈值 → 警告放行
+      if (hasMultiComplete) {
+        const multiV = violations.find((v) => v.type === "MULTI_COMPLETE");
+        const correctedTaskIds = corrections.map(c => c.todoId);
+        
+        client.app.log({
+          body: {
+            service: "todo-validator",
+            level: "warn",
+            message: `WARNING: batch completion attempt ${multiV.count} tasks (${cumulativeViolations}/${MAX_CUMULATIVE_VIOLATIONS} violations) in session ${sessionID}`,
+            extra: { sessionID, violations, cumulativeViolations },
+          },
+        });
+
+        // 自动修正为 in_progress
+        for (const { todo } of corrections) {
+          todo.status = "in_progress";
+        }
+
+        // 返回警告消息（在错误消息中）
+        const warningMsg = 
+          `警告：本次你尝试一次完成 ${multiV.count} 个任务，这可能是作弊行为。\n` +
+          `已自动修正需要修改的任务 ID: ${correctedTaskIds.join(', ')}\n\n` +
+          `注意：累计违规达到 ${MAX_CUMULATIVE_VIOLATIONS} 次后将强制阻断。\n` +
+          `正确做法：先将任务 status 改为 "in_progress"，完成后再改为 "completed"。`;
+
+        // 修改 output 以包含警告消息
+        if (output.error) {
+          output.error = warningMsg;
+        }
       }
 
       // SKIP_IN_PROGRESS（无 MULTI_COMPLETE）: 自动修正 → 放行

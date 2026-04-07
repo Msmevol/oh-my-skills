@@ -6,6 +6,8 @@
  * 2. 当 session 变为 idle/done 但 todos 未完成时，自动发送继续指令
  * 3. 支持配置白名单 agent（某些 agent 允许提前结束）
  * 4. 记录所有干预事件到日志
+ * 5. 智能恢复策略 - 根据完成进度决定恢复方式
+ * 6. 统计信息收集 - 收集干预成功率
  *
  * 解决的问题：
  * - 小模型自作主张提前结束会话
@@ -23,6 +25,33 @@ const RESTART_COOLDOWN_MS = 10000;
 
 const restartCounters = new Map();
 const lastRestartTime = new Map();
+
+/** 统计信息 */
+const statistics = {
+  totalRestarts: 0,
+  successfulRestarts: 0,
+  failedRestarts: 0,
+  sessionsMonitored: new Set(),
+};
+
+/** 计算完成进度百分比 */
+function calculateProgress(completedTodos, totalTodos) {
+  if (totalTodos === 0) return 0;
+  return Math.round((completedTodos / totalTodos) * 100);
+}
+
+/** 根据进度决定恢复策略 */
+function getRecoveryStrategy(completedTodos, totalTodos) {
+  const progress = calculateProgress(completedTodos, totalTodos);
+  
+  if (progress === 0) {
+    return "full_restart"; // 完全没有进展，需要完全重新开始
+  } else if (progress < 30) {
+    return "restart_with_context"; // 进度很少，带着上下文重启
+  } else {
+    return "continue_from_checkpoint"; // 进度不错，从断点继续
+  }
+}
 
 function shouldGuardAgent(agentName) {
   if (GUARDED_AGENTS.has("*")) return true;
@@ -55,7 +84,7 @@ function recordRestart(sessionID) {
   incrementRestartCount(sessionID);
 }
 
-function buildContinueMessage(incompleteTodos, completedTodos) {
+function buildContinueMessage(incompleteTodos, completedTodos, strategy = "continue_from_checkpoint") {
   const remainingList = incompleteTodos
     .map((t) => `- [ ] ${t.content}`)
     .join("\n");
@@ -63,8 +92,23 @@ function buildContinueMessage(incompleteTodos, completedTodos) {
     .map((t) => `- [x] ${t.content}`)
     .join("\n");
 
+  const progress = calculateProgress(completedTodos.length, completedTodos.length + incompleteTodos.length);
+  
+  let strategyMsg = "";
+  switch (strategy) {
+    case "full_restart":
+      strategyMsg = "⚠️ 检测到你完全没有完成任务，需要完全重新开始。\n";
+      break;
+    case "restart_with_context":
+      strategyMsg = `⚠️ 检测到你的进度很少（${progress}%），需要带着上下文重新开始。\n`;
+      break;
+    case "continue_from_checkpoint":
+    default:
+      strategyMsg = `✅ 检测到你的进度为 ${progress}%，将从断点继续执行。\n`;
+  }
+
   return (
-    `⚠️ 检测到你的会话提前结束了，但还有未完成的任务。\n\n` +
+    `${strategyMsg}\n` +
     `已完成的任务：\n${completedList || "无"}\n\n` +
     `剩余必须完成的任务：\n${remainingList}\n\n` +
     `重要要求：\n` +
@@ -163,12 +207,36 @@ export const SessionGuardPlugin = async ({ client, directory }) => {
 
       recordRestart(sessionID);
 
-      const continueMsg = buildContinueMessage(incompleteTodos, completedTodos);
+      // 更新统计信息
+      statistics.totalRestarts++;
+      statistics.sessionsMonitored.add(sessionID);
+
+      // 根据完成进度选择恢复策略
+      const strategy = getRecoveryStrategy(completedTodos.length, todos.length);
+      const continueMsg = buildContinueMessage(incompleteTodos, completedTodos, strategy);
 
       try {
         await client.session.message(sessionID, {
           message: continueMsg,
           agent: agentName,
+        });
+
+        // 记录成功恢复
+        statistics.successfulRestarts++;
+
+        client.app.log({
+          body: {
+            service: "session-guard",
+            level: "info",
+            message: `Auto-restart successful for session ${sessionID} (strategy: ${strategy})`,
+            extra: {
+              sessionID,
+              strategy,
+              progress: calculateProgress(completedTodos.length, todos.length),
+              totalRestarts: statistics.totalRestarts,
+              successfulRestarts: statistics.successfulRestarts,
+            },
+          },
         });
 
         client.app.log({
@@ -180,15 +248,34 @@ export const SessionGuardPlugin = async ({ client, directory }) => {
           },
         });
       } catch (e) {
+        // 记录失败
+        statistics.failedRestarts++;
+        
         client.app.log({
           body: {
             service: "session-guard",
             level: "error",
             message: `Failed to send continue message to session ${sessionID}: ${e.message}`,
-            extra: { sessionID },
+            extra: { 
+              sessionID,
+              error: e.message,
+              totalRestarts: statistics.totalRestarts,
+              failedRestarts: statistics.failedRestarts,
+            },
           },
         });
       }
+    },
+
+    // 统计信息端点（可选，用于外部查询）
+    "server.started": async () => {
+      client.app.log({
+        body: {
+          service: "session-guard",
+          level: "info",
+          message: `Session Guard Plugin initialized with stats: ${JSON.stringify(statistics)}`,
+        },
+      });
     },
 
     "chat.message": async (input, output) => {

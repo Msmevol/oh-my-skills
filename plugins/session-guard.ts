@@ -91,11 +91,15 @@ export const SessionGuardPlugin = async ({ client, directory }) => {
     event: async ({ event }) => {
       if (event.type !== "session.idle") return;
 
-      const sessionInfo = event.properties?.info;
-      if (!sessionInfo) return;
+      // opencode 1.3.13: session.idle event 结构为 event.properties.sessionID (string)
+      const sessionID =
+        event.properties?.info?.id ||
+        event.properties?.sessionID;
 
-      const sessionID = sessionInfo.id;
-      const agentName = sessionInfo.agent;
+      if (!sessionID) return;
+
+      // 获取 agent 名称：通过 client 从 session 信息中获取
+      let agentName = event.properties?.info?.agent || "default";
 
       if (!shouldGuardAgent(agentName)) return;
       if (!canRestart(sessionID)) {
@@ -190,16 +194,28 @@ export const SessionGuardPlugin = async ({ client, directory }) => {
     "chat.message": async (input, output) => {
       if (!shouldGuardAgent(input.agent)) return;
 
-      output.parts.push({
-        type: "text",
-        text:
+      // 追加警告文本到已有的第一个 text part，避免 id 冲突导致原始内容被丢弃
+      const firstTextPart = output.parts.find((p) => p.type === "text");
+      if (firstTextPart) {
+        firstTextPart.text +=
           "\n\n⚠️ 系统强制要求：\n" +
           "1. 你必须严格按照任务列表逐条执行，不要跳步\n" +
           "2. 每完成一个任务就用 todowrite 标记为 completed\n" +
           "3. 不要提前结束会话，只有所有任务都完成后才能结束\n" +
           "4. 如果遇到困难，尝试多种方法解决，不要跳过任务\n" +
-          "5. 系统会自动监控你的进度，如果提前结束会自动恢复\n",
-      });
+          "5. 系统会自动监控你的进度，如果提前结束会自动恢复\n";
+      } else {
+        output.parts.push({
+          type: "text",
+          text:
+            "\n\n⚠️ 系统强制要求：\n" +
+            "1. 你必须严格按照任务列表逐条执行，不要跳步\n" +
+            "2. 每完成一个任务就用 todowrite 标记为 completed\n" +
+            "3. 不要提前结束会话，只有所有任务都完成后才能结束\n" +
+            "4. 如果遇到困难，尝试多种方法解决，不要跳过任务\n" +
+            "5. 系统会自动监控你的进度，如果提前结束会自动恢复\n",
+        });
+      }
     },
   };
 };

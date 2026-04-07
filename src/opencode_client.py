@@ -8,6 +8,7 @@ import time
 import subprocess
 import json
 import os
+import shutil
 from typing import Optional
 
 import requests
@@ -92,7 +93,10 @@ class OpenCodeClient:
         agent: Optional[str] = None,
         model: Optional[str] = None,
     ) -> dict:
-        """发送消息并等待响应
+        """发送消息
+
+        POST /session/{id}/message 是 fire-and-forget（opencode 11ms 内返回），
+        不等待模型完成。使用短 timeout + 无重试避免无效等待。
 
         API 格式: POST /session/{id}/message
         Body: {"parts": [{"type": "text", "text": "..."}], "agent": "...", "model": "..."}
@@ -106,8 +110,25 @@ class OpenCodeClient:
         logger.info(
             f"Sending message to session {session_id} (agent: {agent or 'default'})"
         )
-        result = self._request("POST", f"/session/{session_id}/message", json=body)
-        return result
+
+        try:
+            response = self.session.request(
+                "POST",
+                self._url(f"/session/{session_id}/message"),
+                json=body,
+                timeout=10,
+            )
+            response.raise_for_status()
+            if not response.text:
+                return {}
+            return response.json()
+        except requests.exceptions.Timeout:
+            # POST /message 是 fire-and-forget，超时不影响功能
+            logger.warning(f"send_message timed out (expected for fire-and-forget)")
+            return {}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"send_message failed: {e}")
+            raise
 
     def send_message_async(
         self, session_id: str, message: str, agent: Optional[str] = None
@@ -121,7 +142,9 @@ class OpenCodeClient:
 
     def get_session_status(self) -> dict:
         """获取所有 session 的状态
-        返回: {session_id: {state, ...}}
+
+        返回: {session_id: {type: "busy"|"idle"|"retry", ...}}
+        注意：已完成或未活跃的 session 不会出现在返回值中。
         """
         result = self._request("GET", "/session/status")
         return result
@@ -242,9 +265,6 @@ class OpenCodeClient:
             f"Load and execute the skill '{skill_name}'. {user_request or ''}".strip()
         )
 
-        # Find opencode executable (Windows uses .cmd)
-        import shutil
-
         opencode_cmd = (
             shutil.which("opencode.cmd") or shutil.which("opencode") or "opencode"
         )
@@ -259,6 +279,8 @@ class OpenCodeClient:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 cwd=working_dir,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
@@ -266,14 +288,16 @@ class OpenCodeClient:
 
             output = {
                 "status": "success" if result.returncode == 0 else "failed",
-                "stdout": result.stdout,
-                "stderr": result.stderr,
+                "stdout": result.stdout or "",
+                "stderr": result.stderr or "",
                 "returncode": result.returncode,
                 "error": None,
             }
 
             if result.returncode != 0:
-                output["error"] = result.stderr or f"Exit code: {result.returncode}"
+                output["error"] = (
+                    result.stderr or ""
+                ) or f"Exit code: {result.returncode}"
 
             logger.info(
                 f"Skill '{skill_name}' completed with status: {output['status']}"
@@ -307,3 +331,37 @@ class OpenCodeClient:
                 "returncode": -1,
                 "error": f"Unexpected error: {e}",
             }
+
+    def execute_skill_via_api(
+        self,
+        session_id: str,
+        skill_name: str,
+        user_request: str = None,
+        agent: str = "skill-executor",
+    ) -> dict:
+        """通过 OpenCode API 执行 skill
+
+        使用正确的 OpenCode skill 机制：
+        1. 构建消息，让 agent 知道需要执行 skill
+        2. agent 会通过 skill 工具加载 SKILL.md
+        3. 自动使用 todowrite 管理任务
+
+        Args:
+            session_id: session ID
+            skill_name: skill 名称
+            user_request: 用户请求
+            agent: agent 名称
+
+        Returns:
+            API 响应结果
+        """
+        message = (
+            f"请加载并执行 skill: {skill_name}\n\n"
+            f"用户请求: {user_request or '请按照 skill 定义执行任务'}\n\n"
+            f"请严格按照 skill 的步骤执行，使用 todowrite 工具管理任务列表，"
+            f"每个任务完成后更新状态为 completed。"
+        )
+
+        logger.info(f"Executing skill '{skill_name}' via API for session {session_id}")
+
+        return self.send_message(session_id, message, agent=agent)

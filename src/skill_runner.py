@@ -149,10 +149,13 @@ class SkillRunner:
         self.execution_log.clear()
 
         try:
-            prompt = self._build_prompt(skill_content, user_request)
-
+            # 不再手动构建 prompt，而是通过 API 让 agent 加载 skill
             self.session = self._create_session(skill_name)
-            self.session.send(prompt)
+
+            # 使用新的 API 调用方式，让 agent 通过 skill 工具加载 skill
+            self.client.execute_skill_via_api(
+                self.session.session_id, skill_name, user_request, self.agent_name
+            )
 
             logger.info(
                 f"Skill '{skill_name}' execution started. "
